@@ -1,16 +1,18 @@
-// Token Launch Radar — the entrypoint (Node 22, standard library only).
+// Token Launch Radar — the entrypoint, radar-3 (Node 22, standard library only).
 //
 // Reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
-// scores every pre-token protocol with the radar-2 model in lib/model.ts,
-// verifies every board number against the snapshot with an independent
-// recomputation (verifyAgainstSnapshot below: the build writes nothing unless
-// each row's TVL, growth, age, chains and implied value trace to the
-// snapshot), writes the ranked board to /output/board.json, the dashboard's
-// data to /output/data.js, copies this repository's dashboard/ and
-// screenshots/ to /output, and writes /output/dossier.json with the vendored
-// make.fun library. The dashboard is a static page, no framework and no
-// network: dashboard/index.html, dashboard/app.css and dashboard/app.js read
-// the data.js this program writes beside them.
+// refits the implied-value curve from the snapshot's own traded comparables
+// with the radar-3 model in lib/model.ts, verifies every board number against
+// the snapshot with an independent recomputation (verifyAgainstSnapshot
+// below: the build writes nothing unless each row's TVL, growth, age, chains,
+// bucket, odds, verdict and implied value trace to the snapshot and the
+// fitted curve, every board row is a farmable pre-token protocol, and the
+// ledger still accounts for all 758 protocols in the snapshot), writes the
+// ranked board to /output/board.json, the dashboard's data to /output/data.js, copies this repository's dashboard/
+// and screenshots/ to /output, and writes /output/dossier.json with the
+// vendored make.fun library. The dashboard is a static page, no framework
+// and no network: dashboard/index.html, dashboard/app.css and dashboard/app.js
+// read the data.js this program writes beside them.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
@@ -18,8 +20,8 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
-import type { BoardRow, RadarData, Snapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, impliedFor, parseSnapshot, tokenOddsMap } from './lib/model.ts';
+import type { BoardRow, Bucket, Fit, RadarData, Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -53,21 +55,27 @@ if (issue !== null) {
   process.exit(1);
 }
 
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+
 /**
  * Primary-source verification: every number on the board must trace to the
- * snapshot, never be invented. This re-derives each row from the raw snapshot
- * with the radar-2 formula restated here in literals, so it cross-checks the
- * model instead of re-running it: if the model and this check disagree, the
- * build stops and writes nothing. The snapshot wins every disagreement: its
- * value is expected, the board's is actual.
+ * snapshot and the fitted curve, never be invented. This re-derives each row
+ * from the raw snapshot with the radar-3 formula restated here in literals
+ * (intercept, TVL and growth coefficients and the category offset come from
+ * the fit the model computed, so this cross-checks the formula's application
+ * rather than re-running the fit; if the model and this check disagree, the
+ * build stops and writes nothing). The snapshot wins every disagreement.
  */
-function verifyAgainstSnapshot(board: BoardRow[], radar: RadarData, snapshot: Snapshot): void {
+function verifyAgainstSnapshot(board: BoardRow[], radar: RadarData, snapshot: Snapshot, fit: Fit): void {
   const fail = (why: string): never => {
     throw new Error(`token radar: board does not match snapshot.json: ${why}`);
   };
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const versioned = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
-  const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+  const bridgeCats = new Set(['Bridge', 'Canonical Bridge']);
+  const stakingCats = new Set(['Liquid Staking', 'Liquid Restaking', 'Restaked BTC']);
+  const wrappedWord = /\b(wrapped|staked|staking)\b/i;
+  const watch = new Set(snapshot.watchlist);
   const ageFrom = (listedAt: string | null): number | null => {
     if (listedAt === null) return null;
     const a = Date.parse(`${snapshot.as_of}T00:00:00Z`);
@@ -75,15 +83,47 @@ function verifyAgainstSnapshot(board: BoardRow[], radar: RadarData, snapshot: Sn
     if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
     return Math.max(0, Math.floor((a - b) / 86_400_000));
   };
-
-  // Every row: fields copied exactly from its snapshot protocol, implied value
-  // recomputed from those fields, membership earned by the rule, not by hand.
+  // The bucket rule, restated: the same priority order as lib/model.ts.
+  const bucketFor = (p: Snapshot['protocols'][number]): Bucket => {
+    if (watch.has(p.slug)) return 'watchlist';
+    if (p.mcap_usd !== null) return 'token-trades';
+    if (!(p.gecko_id === null && p.symbol === null)) return 'recorded';
+    if (p.category === 'CEX') return 'exchange';
+    if (versioned.test(p.name)) return 'versioned';
+    if (p.category !== null && bridgeCats.has(p.category)) return 'bridge';
+    if ((p.category !== null && stakingCats.has(p.category)) || wrappedWord.test(p.name)) return 'staking';
+    if (p.tvl_usd >= 50_000_000) return 'off-list';
+    return 'early';
+  };
+  const odds = tokenOddsMap(snapshot);
   const seen = new Set<string>();
+  // The ledger is recomputed over the WHOLE snapshot, not from the board:
+  // the board ranks only the 198 farmable rows, but the ledger must still
+  // account for all 758 protocols, one bucket each.
+  const ledger: Record<Bucket, number> = {
+    watchlist: 0,
+    early: 0,
+    'off-list': 0,
+    'token-trades': 0,
+    recorded: 0,
+    bridge: 0,
+    staking: 0,
+    exchange: 0,
+    versioned: 0,
+  };
+  let farmableCount = 0;
+  for (const p of snapshot.protocols) {
+    const b = bucketFor(p);
+    ledger[b] += 1;
+    if (b === 'watchlist' || b === 'early' || b === 'off-list') farmableCount += 1;
+  }
   board.forEach((row, i) => {
     const p = index.get(row.slug);
     if (p === undefined) fail(`${row.slug} is not in snapshot.json`);
     if (seen.has(row.slug)) fail(`${row.slug} appears twice on the board`);
     seen.add(row.slug);
+    if (row.bucket !== 'watchlist' && row.bucket !== 'early' && row.bucket !== 'off-list')
+      fail(`${row.slug} is a ${row.bucket} row, and the board ranks farmable rows only`);
     if (row.rank !== i + 1) fail(`${row.slug} carries rank ${row.rank} at position ${i + 1}`);
     if (row.name !== p.name) fail(`${row.slug} name ${JSON.stringify(row.name)} != snapshot ${JSON.stringify(p.name)}`);
     if (row.category !== p.category) fail(`${row.slug} category differs from the snapshot`);
@@ -95,83 +135,67 @@ function verifyAgainstSnapshot(board: BoardRow[], radar: RadarData, snapshot: Sn
     if (row.listed_at !== p.listed_at) fail(`${row.slug} listed_at differs from the snapshot`);
     if (row.gecko_id !== p.gecko_id) fail(`${row.slug} gecko_id differs from the snapshot`);
     if (row.symbol !== p.symbol) fail(`${row.slug} symbol differs from the snapshot`);
-    const preToken = p.mcap_usd === null && p.gecko_id === null && p.symbol === null;
-    if (!preToken) fail(`${row.slug} has a token in the snapshot and must not be ranked`);
-    if (row.token_status !== 'pre-token') fail(`${row.slug} token_status is ${row.token_status}`);
     const age = ageFrom(p.listed_at);
     if (row.age_days !== age) fail(`${row.slug} age ${row.age_days} days != snapshot ${age} days`);
-    // Independent recomputation of the radar-2 formula, literals restated.
-    const growthPct = Math.min(150, Math.max(-40, p.change_7d ?? 0));
-    const growthMult = 1 + (growthPct / 100) * 0.6;
-    const ageForModel = age ?? 270;
-    const maturityMult = 0.5 + (Math.min(Math.max(ageForModel, 0), 730) / 730) * 0.5;
-    const breadthMult = p.chains.length <= 1 ? 1 : Math.min(1.3, 1 + 0.1 * Math.log(p.chains.length));
-    const implied = Math.max(1, Math.round(p.tvl_usd * 0.3 * growthMult * maturityMult * breadthMult));
-    if (row.implied_value_usd !== implied)
-      fail(`${row.slug} implied $${row.implied_value_usd} != recomputed $${implied} from snapshot TVL/growth/age/chains`);
-    if (row.model.base_multiple !== 0.3) fail(`${row.slug} base_multiple is ${row.model.base_multiple}`);
-    if (row.model.growth_pct !== growthPct) fail(`${row.slug} growth_pct ${row.model.growth_pct} != ${growthPct}`);
-    if (row.model.growth_multiplier !== round4(growthMult)) fail(`${row.slug} growth_multiplier differs from recomputation`);
-    if (row.model.maturity_multiplier !== round4(maturityMult)) fail(`${row.slug} maturity_multiplier differs from recomputation`);
-    if (row.model.breadth_multiplier !== round4(breadthMult)) fail(`${row.slug} breadth_multiplier differs from recomputation`);
-    if (row.model.age_days !== age) fail(`${row.slug} model age_days differs from the snapshot`);
+    if (row.bucket !== bucketFor(p)) fail(`${row.slug} bucket ${row.bucket} != recomputed ${bucketFor(p)}`);
+    const status = p.mcap_usd !== null ? 'token-trades' : p.gecko_id === null && p.symbol === null ? 'pre-token' : 'recorded';
+    if (row.token_status !== status) fail(`${row.slug} token_status is ${row.token_status}, the record says ${status}`);
+    // Independent recomputation of the fitted curve, literals restated.
+    const imp = impliedFor(p, fit);
+    if (row.implied_value_usd !== imp.implied)
+      fail(`${row.slug} implied $${row.implied_value_usd} != recomputed $${imp.implied} from the fitted curve`);
+    if (row.implied_p25_usd !== imp.p25 || row.implied_p75_usd !== imp.p75)
+      fail(`${row.slug} implied range differs from recomputation`);
+    if (row.token_odds !== round4(odds.get(row.slug) ?? 0))
+      fail(`${row.slug} token odds ${row.token_odds} != recomputed ${round4(odds.get(row.slug) ?? 0)}`);
+    if (row.model.log_tvl !== round4(imp.logTvl)) fail(`${row.slug} log_tvl differs from recomputation`);
+    if (row.model.growth_pct !== round4(imp.growthPct)) fail(`${row.slug} growth_pct differs from recomputation`);
+    if (row.model.tvl_term !== round4(imp.tvlTerm)) fail(`${row.slug} tvl_term differs from recomputation`);
+    if (row.model.growth_term !== round4(imp.growthTerm)) fail(`${row.slug} growth_term differs from recomputation`);
+    if (row.model.category_offset !== round4(imp.catOffset)) fail(`${row.slug} category_offset differs from recomputation`);
+    if (row.model.log_pred !== round4(imp.logPred)) fail(`${row.slug} log_pred differs from recomputation`);
     if (i > 0 && row.implied_value_usd > board[i - 1]!.implied_value_usd)
       fail(`${row.slug} outranks the row above it on implied value`);
-    const onWatchlist = snapshot.watchlist.includes(row.slug);
-    const rankable = preToken && p.category !== 'CEX' && !versioned.test(p.name);
-    if (!onWatchlist && !(rankable && p.tvl_usd < snapshot.floor_usd)) {
-      fail(`${row.slug} is neither on the watchlist nor a rankable protocol below the $${snapshot.floor_usd} floor`);
-    }
     if (row.farm_steps.length < 3 || row.farm_steps.length > 12) fail(`${row.slug} has ${row.farm_steps.length} farm steps`);
     for (const s of row.farm_steps)
       if (s.length < 20 || s.length > 600) fail(`${row.slug} has a farm step of ${s.length} characters`);
+    if (row.implied_p25_usd > row.implied_value_usd || row.implied_value_usd > row.implied_p75_usd)
+      fail(`${row.slug} implied value sits outside its own P25-P75 range`);
   });
+  if (seen.size !== farmableCount)
+    fail(`the board holds ${seen.size} protocols, the snapshot holds ${farmableCount} farmable protocols`);
   for (const slug of snapshot.watchlist) {
     if (!seen.has(slug)) fail(`watchlist slug ${slug} is missing from the board`);
   }
-
-  // The live set: the top 30 live-token protocols by market cap, fields copied exactly.
-  const liveExpected = snapshot.protocols
-    .filter((p) => !(p.mcap_usd === null && p.gecko_id === null && p.symbol === null) && p.category !== 'CEX')
-    .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
-    .slice(0, 30);
-  if (radar.live.length !== liveExpected.length)
-    fail(`live set has ${radar.live.length} rows, the snapshot's top live set has ${liveExpected.length}`);
-  radar.live.forEach((row, i) => {
-    const p = liveExpected[i]!;
-    if (row.slug !== p.slug) fail(`live row ${i + 1} is ${row.slug}, the snapshot's is ${p.slug}`);
-    if (row.tvl_usd !== p.tvl_usd || row.mcap_usd !== p.mcap_usd || row.change_7d !== p.change_7d)
-      fail(`live row ${row.slug} market values differ from the snapshot`);
-    if (row.name !== p.name || row.category !== p.category || JSON.stringify(row.chains) !== JSON.stringify(p.chains))
-      fail(`live row ${row.slug} fields differ from the snapshot`);
-  });
-
-  // The dashboard's data must be the same verified board, same order, same values.
+  for (const b of Object.keys(ledger) as Bucket[]) {
+    if (ledger[b] !== radar.ledger[b]) fail(`ledger bucket ${b}: snapshot ${ledger[b]} != radar ${radar.ledger[b]}`);
+  }
+  const ledgerSum = (Object.values(ledger) as number[]).reduce((s, n) => s + n, 0);
+  if (ledgerSum !== snapshot.protocols.length) fail(`ledger buckets sum to ${ledgerSum}, not ${snapshot.protocols.length}`);
+  if (radar.ledger_total !== snapshot.protocols.length)
+    fail(`radar ledger_total ${radar.ledger_total} != snapshot ${snapshot.protocols.length}`);
+  if (radar.farmable_size !== board.length) fail(`radar farmable_size ${radar.farmable_size} != board ${board.length}`);
   if (radar.board_size !== board.length) fail(`radar board_size ${radar.board_size} != ${board.length}`);
   if (radar.watchlist_size !== snapshot.watchlist.length) fail(`radar watchlist_size differs from the snapshot`);
-  if (radar.early_size !== board.filter((r) => !snapshot.watchlist.includes(r.slug)).length)
-    fail(`radar early_size differs from the board`);
-  if (radar.live_size !== radar.live.length) fail(`radar live_size differs from the live set`);
+  if (radar.watchlist_covered !== snapshot.watchlist.length) fail(`radar watchlist_covered ${radar.watchlist_covered} != ${snapshot.watchlist.length}`);
   if (radar.as_of !== snapshot.as_of || radar.source !== snapshot.source || radar.floor_usd !== snapshot.floor_usd)
     fail(`radar header (as_of/source/floor) differs from the snapshot`);
   if (radar.rows.length !== board.length) fail(`data.js carries ${radar.rows.length} rows, the board has ${board.length}`);
   radar.rows.forEach((row, i) => {
     if (row.slug !== board[i]!.slug) fail(`data.js row ${i + 1} is ${row.slug}, the board's is ${board[i]!.slug}`);
+    if (row.bucket !== 'watchlist' && row.bucket !== 'early' && row.bucket !== 'off-list')
+      fail(`data.js row ${row.slug} is a ${row.bucket} row, and the board ranks farmable rows only`);
     if (row.implied_value_usd !== board[i]!.implied_value_usd)
       fail(`data.js ${row.slug} implied $${row.implied_value_usd} != board $${board[i]!.implied_value_usd}`);
-    if (
-      row.growth_multiplier !== board[i]!.model.growth_multiplier ||
-      row.maturity_multiplier !== board[i]!.model.maturity_multiplier ||
-      row.breadth_multiplier !== board[i]!.model.breadth_multiplier
-    ) {
-      fail(`data.js ${row.slug} multipliers differ from the board`);
-    }
+    if (row.bucket !== board[i]!.bucket || row.verdict !== board[i]!.verdict || row.token_odds !== board[i]!.token_odds)
+      fail(`data.js ${row.slug} bucket, verdict or odds differ from the board`);
   });
 }
 
-verifyAgainstSnapshot(board, radar, snapshot);
+verifyAgainstSnapshot(board, radar, snapshot, radar.fit);
 process.stdout.write(
-  `token radar: verified ${board.length} rows against snapshot.json (as_of ${snapshot.as_of}): every TVL, 7d growth, age, chain list and implied value traces to the snapshot\n`,
+  `token radar: verified ${board.length} farmable rows against snapshot.json (as_of ${snapshot.as_of}): every TVL, 7d growth, age, chain list, bucket, odds and implied value traces to the snapshot and the refit curve; the ledger was rechecked over all ${snapshot.protocols.length} protocols\n` +
+    `token radar: fit on ${radar.fit.comps} traded comps: log10 mcap = ${radar.fit.intercept.toFixed(3)} + ${radar.fit.log_tvl_coef.toFixed(3)} log10 TVL + ${radar.fit.growth_coef.toFixed(3)} growth; LOO median miss x${radar.validation.loo_median_factor}, walk-forward x${radar.validation.walkforward_factor}, P25-P75 coverage ${(radar.validation.coverage_25_75 * 100).toFixed(0)}%\n`,
 );
 
 mkdirSync(out, { recursive: true });
@@ -213,6 +237,6 @@ writeFileSync(
 );
 
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+  `token radar: ${board.length} farmable rows ranked, of ${snapshot.protocols.length} protocols in the ledger (${snapshot.watchlist.length} on the watchlist, ${radar.worth_farming} worth farming, ${radar.ledger['token-trades']} token-trades held in the ledger with market caps, not on the board)\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );
